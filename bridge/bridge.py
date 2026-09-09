@@ -1,80 +1,186 @@
 #!/usr/bin/env python3
-"""Small HTTP bridge from Home Assistant Assist to Hermes Agent.
+"""Narrow local HTTP bridge from Home Assistant Assist to the TARS Home API.
+
+The bridge deliberately does not import or execute Hermes.  It only forwards an
+already-authenticated Assist request to the running Hermes Gateway API's
+``tars-home`` profile, which keeps the household agent's tool restrictions and
+persistent conversation state in one authoritative process.
 
 Endpoints:
-- GET /health
-- POST /api/chat with an Authorization header containing the bridge API key
+* ``GET /health``
+* ``POST /api/chat`` with a bridge bearer key
 
-This bridge is optional. HACS installs only the Home Assistant custom
-integration; run this bridge separately on the machine that has Hermes Agent.
+Required runtime secrets are injected from 1Password at service start; neither
+keys nor their values belong in this repository or Home Assistant configuration.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
-import subprocess
+import re
 import sys
-import threading
 import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib import error, parse, request
 
 HOST = os.environ.get("HERMES_ASSIST_HOST", "127.0.0.1")
 PORT = int(os.environ.get("HERMES_ASSIST_PORT", "8765"))
-KEY_FILE = Path(os.environ.get("HERMES_ASSIST_KEY_FILE", "./hermes-assist-bridge.key"))
-HERMES_BIN = os.environ.get("HERMES_BIN", "hermes")
-HERMES_REPO = os.environ.get("HERMES_REPO", "")
-HERMES_ENV_FILE = os.environ.get("HERMES_ENV_FILE", "")
-TIMEOUT = int(os.environ.get("HERMES_ASSIST_TIMEOUT", "120"))
-MAX_PROMPT_CHARS = int(os.environ.get("HERMES_ASSIST_MAX_PROMPT_CHARS", "6000"))
-MAX_HISTORY_MESSAGES = int(os.environ.get("HERMES_ASSIST_MAX_HISTORY_MESSAGES", "8"))
-USE_DIRECT_AGENT = os.environ.get("HERMES_ASSIST_USE_DIRECT_AGENT", "0").lower() in {"1", "true", "yes"}
-MODEL = os.environ.get("HERMES_ASSIST_MODEL", "")
-PROVIDER = os.environ.get("HERMES_ASSIST_PROVIDER", "")
-TOOLSETS = [x.strip() for x in os.environ.get("HERMES_ASSIST_TOOLSETS", "").split(",") if x.strip()]
-MAX_TURNS = int(os.environ.get("HERMES_ASSIST_MAX_TURNS", "8"))
-REASONING_EFFORT = os.environ.get("HERMES_ASSIST_REASONING", "minimal")
-
-SYSTEM_PROMPT = """You are Hermes Agent answering through Home Assistant Assist.
-Keep replies concise and speech-friendly. Avoid Markdown tables and visual-only instructions.
-Use the recent conversation context to resolve pronouns and follow-up questions.
-Safety: do not unlock doors, disable alarms, delete/send email, or make broad smart-home changes unless the spoken request is explicit and unambiguous. If unsure, ask a short clarifying question.
-For ordinary device-control phrases that Home Assistant should handle directly, say briefly that this command should be routed to Home Assistant's built-in agent unless you can safely complete it with your available tools.
-"""
-
-_AGENT = None
-_AGENT_LOCK = threading.Lock()
-_AGENT_READY = False
-_AGENT_ERROR: str | None = None
+BRIDGE_KEY_FILE = Path(os.environ.get("HERMES_ASSIST_BRIDGE_KEY_FILE", "./hermes-assist-bridge.key"))
+HERMES_API_URL = os.environ.get("HERMES_API_URL", "http://127.0.0.1:8642")
+HERMES_API_KEY = os.environ.get("HERMES_API_KEY", "").strip()
+DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("HERMES_ASSIST_TIMEOUT", "90"))
+TEST_MODE = os.environ.get("HERMES_ASSIST_TEST_MODE", "0").lower() in {"1", "true", "yes"}
+MAX_REQUEST_BYTES = 1_000_000
+MAX_RESPONSE_BYTES = 1_000_000
+MAX_TEXT_CHARS = 6_000
+MAX_CONVERSATION_ID_LENGTH = 96
+PROFILE_NAME = "tars-home"
 
 
-def load_env_file(path: str) -> None:
-    """Load simple KEY=VALUE secrets into the bridge process environment."""
-    if not path:
-        return
-    env_path = Path(path).expanduser()
-    if not env_path.exists():
-        return
-    for raw_line in env_path.read_text(errors="ignore").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key:
-            os.environ[key] = value
+class HermesBridgeError(RuntimeError):
+    """An upstream failure that is safe to show as a generic local error."""
+
+    def __init__(self, message: str, *, status: int = 502):
+        super().__init__(message)
+        self.status = status
+
+    def safe_message(self) -> str:
+        if self.status == 504:
+            return "TARS took too long to answer."
+        if self.status == 401:
+            return "TARS bridge authentication is not configured."
+        return "TARS is temporarily unavailable."
 
 
-load_env_file(HERMES_ENV_FILE)
+@dataclass(frozen=True)
+class HermesReply:
+    text: str
+    session_id: str | None = None
 
 
-def load_key() -> str:
+def _is_loopback_url(value: str) -> bool:
+    parsed = parse.urlparse(value)
+    return parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "::1", "localhost"}
+
+
+def normalise_conversation_id(value: str) -> str:
+    """Return a stable, bounded identifier accepted by the Gateway's conversation store."""
+    raw = str(value).strip()
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-._")
+    if not cleaned:
+        raise ValueError("conversation_id is required")
+    if len(cleaned) <= MAX_CONVERSATION_ID_LENGTH:
+        return cleaned
+    digest = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
+    prefix_len = MAX_CONVERSATION_ID_LENGTH - len(digest) - 1
+    return f"{cleaned[:prefix_len]}-{digest}"
+
+
+def extract_output_text(payload: dict[str, Any]) -> str:
+    """Extract the final speech text from Hermes' OpenAI-compatible Responses shape."""
+    direct = payload.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    output = payload.get("output")
+    if isinstance(output, list):
+        parts: list[str] = []
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    text = part.get("text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text.strip())
+        if parts:
+            return "\n".join(parts)
+    raise HermesBridgeError("Gateway response contained no usable text")
+
+
+class HermesApiClient:
+    """Loopback-only client for the dedicated TARS Home Gateway profile."""
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        *,
+        conversation_prefix: str = "ha",
+        timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    ) -> None:
+        if not _is_loopback_url(base_url):
+            raise ValueError("Hermes API URL must be an http loopback address")
+        if not api_key:
+            raise ValueError("Hermes API key is not configured")
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.conversation_prefix = normalise_conversation_id(conversation_prefix)
+        self.timeout = timeout
+
+    def ask(self, text: str, conversation_id: str) -> HermesReply:
+        conversation = f"{self.conversation_prefix}-{normalise_conversation_id(conversation_id)}"
+        payload = json.dumps({
+            "input": text,
+            "conversation": conversation,
+            "store": True,
+            "truncation": "auto",
+        }).encode("utf-8")
+        req = request.Request(
+            f"{self.base_url}/p/{PROFILE_NAME}/v1/responses",
+            data=payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "X-Hermes-Session-Id": conversation,
+            },
+        )
+        try:
+            with request.urlopen(req, timeout=self.timeout) as response:  # nosec B310: URL is validated loopback
+                raw = response.read(MAX_RESPONSE_BYTES + 1)
+                status = response.status
+                session_id = response.headers.get("X-Hermes-Session-Id")
+            if len(raw) > MAX_RESPONSE_BYTES:
+                raise HermesBridgeError("Gateway response exceeds bridge limit")
+        except error.HTTPError as exc:
+            raise HermesBridgeError("Gateway rejected bridge request", status=exc.code) from exc
+        except TimeoutError as exc:
+            raise HermesBridgeError("Gateway timed out", status=504) from exc
+        except error.URLError as exc:
+            raise HermesBridgeError("Gateway is unreachable") from exc
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HermesBridgeError("Gateway returned invalid JSON", status=status) from exc
+        if not 200 <= status < 300:
+            raise HermesBridgeError("Gateway request failed", status=status)
+        return HermesReply(extract_output_text(data), session_id)
+
+    @staticmethod
+    def safe_error(exc: Exception) -> str:
+        """Never emit request URLs, payloads, or bearer material to HA or logs."""
+        return exc.safe_message() if isinstance(exc, HermesBridgeError) else "TARS is temporarily unavailable."
+
+
+def load_bridge_key() -> str:
+    """Read the inbound bridge key without ever printing it."""
     try:
-        return KEY_FILE.expanduser().read_text().strip()
+        return BRIDGE_KEY_FILE.expanduser().read_text(encoding="utf-8").strip()
     except FileNotFoundError:
-        return os.environ.get("HERMES_ASSIST_API_KEY", "").strip()
+        return os.environ.get("HERMES_ASSIST_BRIDGE_KEY", "").strip()
+
+
+def bridge_auth_required() -> bool:
+    """Channel authentication is intentionally deferred only under explicit test mode."""
+    return not TEST_MODE
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -82,209 +188,81 @@ def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[st
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("X-Content-Type-Options", "nosniff")
     handler.end_headers()
     handler.wfile.write(body)
 
 
-def _content_text(item: dict[str, Any]) -> str:
-    content = item.get("content")
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
-        for part in content:
-            if isinstance(part, dict):
-                txt = part.get("text") or part.get("content")
-                if isinstance(txt, str):
-                    parts.append(txt)
-        return " ".join(parts).strip()
-    return ""
-
-
-def format_history(data: dict[str, Any], current_text: str) -> str:
-    """Extract concise previous chat context from Home Assistant's Assist chat log."""
-    chat_log = data.get("chat_log")
-    if not isinstance(chat_log, dict):
-        return ""
-    items = chat_log.get("content")
-    if not isinstance(items, list):
-        return ""
-
-    lines: list[str] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        role = item.get("role")
-        if role not in {"user", "assistant"}:
-            continue
-        text = _content_text(item)
-        if not text:
-            continue
-        if role == "user" and text.strip().lower() == current_text.strip().lower():
-            continue
-        speaker = "User" if role == "user" else "Assistant"
-        lines.append(f"{speaker}: {text[:600]}")
-
-    if not lines:
-        return ""
-    return "Recent conversation, oldest to newest:\n" + "\n".join(lines[-MAX_HISTORY_MESSAGES:]) + "\n"
-
-
-def get_agent():
-    """Create one in-process Hermes agent and reuse it across voice requests."""
-    global _AGENT, _AGENT_READY, _AGENT_ERROR
-    if _AGENT is not None:
-        return _AGENT
-    with _AGENT_LOCK:
-        if _AGENT is not None:
-            return _AGENT
-        try:
-            if HERMES_REPO:
-                sys.path.insert(0, HERMES_REPO)
-                os.chdir(HERMES_REPO)
-            from hermes_constants import parse_reasoning_effort
-            from run_agent import AIAgent
-
-            kwargs: dict[str, Any] = {
-                "enabled_toolsets": TOOLSETS or None,
-                "max_iterations": MAX_TURNS,
-                "quiet_mode": True,
-                "skip_context_files": True,
-                "skip_memory": True,
-                "reasoning_config": parse_reasoning_effort(REASONING_EFFORT),
-                "platform": "homeassistant",
-            }
-            if MODEL:
-                kwargs["model"] = MODEL
-            if PROVIDER:
-                kwargs["provider"] = PROVIDER
-            _AGENT = AIAgent(**kwargs)
-            _AGENT_READY = True
-            _AGENT_ERROR = None
-            return _AGENT
-        except Exception as exc:  # noqa: BLE001 - fallback to CLI path
-            _AGENT_ERROR = str(exc)
-            _AGENT_READY = False
-            raise
-
-
-def call_hermes_direct(prompt: str) -> tuple[bool, str]:
-    """Call the in-process Hermes agent. Returns (ok, text)."""
-    try:
-        agent = get_agent()
-        with _AGENT_LOCK:
-            return True, (agent.chat(prompt) or "").strip()
-    except Exception as exc:  # noqa: BLE001
-        return False, str(exc)
-
-
-def call_hermes_cli(prompt: str) -> tuple[bool, str]:
-    """Fallback CLI call, slower but simple and robust."""
-    cmd = [HERMES_BIN, "chat", "-q", prompt, "--source", "home-assistant-assist", "-Q", "--max-turns", str(MAX_TURNS)]
-    if PROVIDER:
-        cmd += ["--provider", PROVIDER]
-    if MODEL:
-        cmd += ["-m", MODEL]
-    if TOOLSETS:
-        cmd += ["--toolsets", ",".join(TOOLSETS)]
-    try:
-        proc = subprocess.run(
-            cmd,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=TIMEOUT,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return False, "timeout"
-    except Exception as exc:  # noqa: BLE001
-        return False, str(exc)
-    if proc.returncode != 0:
-        return False, (proc.stderr or proc.stdout or "Hermes exited with an error")[-2000:]
-    return True, (proc.stdout or "").strip()
-
-
 class Handler(BaseHTTPRequestHandler):
-    server_version = "HermesAssistBridge/1.2"
+    server_version = "TARSHomeAssistBridge/2.0"
 
     def log_message(self, fmt: str, *args: Any) -> None:
+        # Access-only logging; never record request headers, bodies, query strings, or upstream errors.
         sys.stderr.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), fmt % args))
+
+    def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
+        """Avoid BaseHTTPRequestHandler's default request-line logging (includes query data)."""
+        safe_path = self.path.split("?", 1)[0]
+        self.log_message('"%s %s" %s %s', self.command, safe_path, str(code), str(size))
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":
-            json_response(self, 200, {"ok": True, "service": "hermes-assist-bridge", "time": time.time(), "direct_agent": USE_DIRECT_AGENT, "agent_ready": _AGENT_READY, "agent_error": _AGENT_ERROR, "model": MODEL, "provider": PROVIDER, "toolsets": TOOLSETS, "max_turns": MAX_TURNS, "reasoning": REASONING_EFFORT})
-        else:
-            json_response(self, 404, {"error": "not_found"})
+            json_response(self, 200, {
+                "ok": bool(HERMES_API_KEY) and (TEST_MODE or bool(load_bridge_key())),
+                "service": "tars-home-assist-bridge",
+                "profile": PROFILE_NAME,
+                "test_mode": TEST_MODE,
+                "time": time.time(),
+            })
+            return
+        json_response(self, 404, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
         if self.path != "/api/chat":
             json_response(self, 404, {"error": "not_found"})
             return
-
-        expected = load_key()
-        auth = self.headers.get("Authorization", "")
-        if not expected or auth != f"Bearer {expected}":
-            json_response(self, 401, {"error": "unauthorized"})
-            return
-
+        if bridge_auth_required():
+            expected = load_bridge_key()
+            supplied = self.headers.get("Authorization", "")
+            if not expected or not hmac.compare_digest(supplied, f"Bearer {expected}"):
+                json_response(self, 401, {"error": "unauthorized"})
+                return
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(min(length, 1024 * 1024))
-            data = json.loads(raw.decode("utf-8")) if raw else {}
-        except Exception as exc:
-            json_response(self, 400, {"error": "bad_json", "detail": str(exc)})
+            if length < 1 or length > MAX_REQUEST_BYTES:
+                raise ValueError("invalid request length")
+            data = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            json_response(self, 400, {"error": "bad_json"})
             return
-
         text = str(data.get("text", "")).strip()
         if not text:
             json_response(self, 400, {"error": "missing_text"})
             return
-
-        conversation_id = str(data.get("conversation_id") or "")
-        language = str(data.get("language") or "")
-        device_id = str(data.get("device_id") or "")
-        extra_system_prompt = str(data.get("extra_system_prompt") or "")
-        history = format_history(data, text)
-
-        prompt = (
-            f"{SYSTEM_PROMPT}\n"
-            f"Home Assistant context:\n"
-            f"- conversation_id: {conversation_id or 'none'}\n"
-            f"- language: {language or 'unknown'}\n"
-            f"- device_id: {device_id or 'unknown'}\n"
-        )
-        if extra_system_prompt:
-            prompt += f"- extra Home Assistant instruction: {extra_system_prompt[:1000]}\n"
-        if history:
-            prompt += f"\n{history}"
-        prompt += f"\nUser said: {text}\n\nReply with only the answer the user should hear."
-        prompt = prompt[:MAX_PROMPT_CHARS]
-
-        ok, output = call_hermes_direct(prompt) if USE_DIRECT_AGENT else call_hermes_cli(prompt)
-        if USE_DIRECT_AGENT and not ok:
-            ok, output = call_hermes_cli(prompt)
-
-        if not ok:
-            if output == "timeout":
-                json_response(self, 504, {"error": "timeout", "reply": "Sorry, Hermes took too long to answer."})
-            else:
-                json_response(self, 502, {"error": "hermes_failed", "detail": output[-2000:], "reply": "Sorry, Hermes failed."})
+        text = text[:MAX_TEXT_CHARS]
+        try:
+            conversation_id = normalise_conversation_id(str(data.get("conversation_id") or ""))
+        except ValueError:
+            json_response(self, 400, {"error": "missing_conversation_id"})
             return
-
-        output = output.strip() or "Hermes did not return a response."
-        json_response(self, 200, {"reply": output, "conversation_id": conversation_id or None})
+        try:
+            reply = HermesApiClient(HERMES_API_URL, HERMES_API_KEY).ask(text, conversation_id)
+        except (ValueError, HermesBridgeError) as exc:
+            safe = HermesApiClient.safe_error(exc)
+            status = exc.status if isinstance(exc, HermesBridgeError) and exc.status == 504 else 502
+            json_response(self, status, {"error": "tars_unavailable", "reply": safe})
+            return
+        json_response(self, 200, {"reply": reply.text, "conversation_id": conversation_id})
 
 
 def main() -> None:
-    if USE_DIRECT_AGENT:
-        try:
-            get_agent()
-        except Exception as exc:  # noqa: BLE001
-            print(f"Direct Hermes agent unavailable, CLI fallback will be used: {exc}", file=sys.stderr, flush=True)
+    if HOST not in {"127.0.0.1", "::1", "localhost"} and not TEST_MODE:
+        raise SystemExit("HERMES_ASSIST_HOST must be loopback-only outside explicit test mode")
+    if not HERMES_API_KEY:
+        raise SystemExit("HERMES_API_KEY must be injected from 1Password")
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"Hermes Assist Bridge listening on http://{HOST}:{PORT}", flush=True)
+    print(f"TARS Home Assist Bridge listening on http://{HOST}:{PORT}", flush=True)
     httpd.serve_forever()
 
 

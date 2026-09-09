@@ -9,7 +9,7 @@ from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import CONF_API_KEY, CONF_URL, DEFAULT_NAME, DEFAULT_URL, DOMAIN
+from .const import CONF_URL, DEFAULT_NAME, DEFAULT_URL, DOMAIN
 
 
 async def _validate_url(hass: HomeAssistant, url: str) -> None:
@@ -18,6 +18,9 @@ async def _validate_url(hass: HomeAssistant, url: str) -> None:
     async with session.get(f"{url.rstrip('/')}/health", timeout=10) as resp:
         if resp.status != 200:
             raise ValueError(f"Bridge returned HTTP {resp.status}")
+        payload = await resp.json(content_type=None)
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            raise ValueError("Bridge is not ready")
 
 
 class HermesAssistConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -42,7 +45,6 @@ class HermesAssistConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     data={
                         CONF_NAME: user_input.get(CONF_NAME) or DEFAULT_NAME,
                         CONF_URL: url,
-                        CONF_API_KEY: user_input[CONF_API_KEY],
                     },
                 )
 
@@ -50,7 +52,6 @@ class HermesAssistConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             {
                 vol.Optional(CONF_NAME, default=DEFAULT_NAME): str,
                 vol.Required(CONF_URL, default=DEFAULT_URL): str,
-                vol.Required(CONF_API_KEY): str,
             }
         )
         return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
